@@ -223,6 +223,22 @@ analyzer {
     fixed-pool-size = 20 // 20 jobs in parallel, size according to your k8s or server resources
   }
   throughput = 1
+
+  # Per-analyzer adaptive concurrency. Limits are raised after successful jobs
+  # and halved when the analyzer reports a rate limit (429/503 or Retry-After).
+  # Rate-limited jobs are retried with backoff; other analyzers keep running.
+  adaptiveConcurrency {
+    enabled = true
+    #max = 20                 # defaults to the analyzer pool size
+    min = 1
+    maxPerAnalyzer = 20
+    initial = 4
+    successesPerIncrease = 2
+    backoff = 1 second
+    maxBackoff = 30 seconds
+    retryAfterCap = 5 minutes
+    maxRetries = 3
+  }
 }
 
 # RESPONDERS

@@ -1,5 +1,7 @@
 package org.thp.cortex.services
 
+import org.apache.pekko.actor.ActorSystem
+import org.apache.pekko.pattern.after
 import org.apache.pekko.stream.Materializer
 import org.apache.pekko.stream.scaladsl.FileIO
 import org.elastic4play.BadRequestError
@@ -16,9 +18,11 @@ import java.nio.file._
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.Date
 import javax.inject.Inject
-import scala.concurrent.duration.DurationLong
+import scala.concurrent.duration.{DurationLong, FiniteDuration}
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
+
+import JobRunnerSrv._
 
 class JobRunnerSrv @Inject() (
     config: Configuration,
@@ -32,6 +36,8 @@ class JobRunnerSrv @Inject() (
     updateSrv: UpdateSrv,
     attachmentSrv: AttachmentSrv,
     executionContextSrv: ExecutionContextSrv,
+    adaptiveConcurrencyLimiter: AdaptiveConcurrencyLimiter,
+    system: ActorSystem,
     implicit val ec: ExecutionContext,
     implicit val mat: Materializer
 ) {
@@ -167,7 +173,7 @@ class JobRunnerSrv @Inject() (
       }
   }
 
-  private def extractReport(jobFolder: Path, job: Job)(implicit authContext: AuthContext, ec: ExecutionContext): Future[Job] = {
+  private def extractReport(jobFolder: Path, job: Job)(implicit authContext: AuthContext, ec: ExecutionContext): Future[AttemptOutcome] = {
     val outputFile = jobFolder.resolve("output").resolve("output.json")
     if (Files.exists(outputFile)) {
       logger.debug(s"Job output: ${new String(Files.readAllBytes(outputFile))}")
@@ -209,13 +215,23 @@ class JobRunnerSrv @Inject() (
             }
           }
           .transformWith {
-            case Failure(e) => endJob(job, JobStatus.Failure, Some(s"Report creation failure: $e"))
-            case _          => endJob(job, JobStatus.Success)
+            case Failure(e) => endJob(job, JobStatus.Failure, Some(s"Report creation failure: $e")).map(AttemptFinished)
+            case _          => endJob(job, JobStatus.Success).map(AttemptFinished)
           }
-      } else
-        endJob(job, JobStatus.Failure, (report \ "errorMessage").asOpt[String], (report \ "input").asOpt[JsValue].map(_.toString))
+      } else {
+        val errorMessage = (report \ "errorMessage").asOpt[String]
+        val input        = (report \ "input").asOpt[JsValue].map(_.toString)
+        errorMessage.flatMap(AdaptiveConcurrencyLimiter.RateLimitSignal.detect) match {
+          case Some(signal) =>
+            Future.successful(
+              AttemptThrottled(errorMessage.getOrElse("Analyzer was rate limited"), signal.retryAfter, input)
+            )
+          case None =>
+            endJob(job, JobStatus.Failure, errorMessage, input).map(AttemptFinished)
+        }
+      }
     } else
-      endJob(job, JobStatus.Failure, Some(s"no output"))
+      endJob(job, JobStatus.Failure, Some(s"no output")).map(AttemptFinished)
   }
 
   def run(worker: Worker, job: Job)(implicit authContext: AuthContext): Future[Job] = {
@@ -226,10 +242,54 @@ class JobRunnerSrv @Inject() (
         logger.error(s"unhandled WorkerType $x")
         analyzerExecutionContext
     }
+
+    def finish(outcome: AttemptOutcome): Future[Job] = outcome match {
+      case AttemptFinished(updatedJob) => Future.successful(updatedJob)
+      case AttemptThrottled(message, _, input) =>
+        endJob(job, JobStatus.Failure, Some(message), input)(authContext, executionContext)
+    }
+
+    if (worker.tpe() == WorkerType.analyzer && adaptiveConcurrencyLimiter.enabled) {
+      def attempt(attemptNumber: Int): Future[Job] =
+        adaptiveConcurrencyLimiter
+          .acquire(worker.id)
+          .flatMap { permit =>
+            runAttempt(worker, job, markStarted = attemptNumber == 0)(executionContext)(authContext).transformWith {
+              case Success(AttemptFinished(updatedJob)) =>
+                permit.release(AdaptiveConcurrencyLimiter.Succeeded)
+                Future.successful(updatedJob)
+              case Success(AttemptThrottled(message, retryAfter, input)) =>
+                val delay = permit
+                  .release(AdaptiveConcurrencyLimiter.Throttled(retryAfter))
+                  .getOrElse(adaptiveConcurrencyLimiter.retryBackoff)
+                if (attemptNumber + 1 < adaptiveConcurrencyLimiter.maxAttempts) {
+                  logger.info(
+                    s"Job ${job.id} on analyzer ${worker.name()} was rate limited; retrying in ${delay.toMillis} ms " +
+                      s"(attempt ${attemptNumber + 2}/${adaptiveConcurrencyLimiter.maxAttempts})"
+                  )
+                  after(delay, system.scheduler)(attempt(attemptNumber + 1))(executionContext)
+                } else {
+                  logger.warn(s"Job ${job.id} on analyzer ${worker.name()} is still rate limited; giving up")
+                  endJob(job, JobStatus.Failure, Some(message), input)(authContext, executionContext)
+                }
+              case Failure(error) =>
+                permit.release(AdaptiveConcurrencyLimiter.Failed)
+                Future.failed(error)
+            }(executionContext)
+          }(executionContext)
+
+      attempt(0)
+    } else
+      runAttempt(worker, job, markStarted = true)(executionContext)(authContext).flatMap(finish)(executionContext)
+  }
+
+  private def runAttempt(worker: Worker, job: Job, markStarted: Boolean)(
+      executionContext: ExecutionContext
+  )(implicit authContext: AuthContext): Future[AttemptOutcome] = {
     var maybeJobFolder: Option[Path] = None
 
     Future {
-      syncStartJob(job).get
+      if (markStarted) syncStartJob(job).get
       val jobFolder = prepareJobFolder(worker, job).get
       maybeJobFolder = Some(jobFolder)
       val result = runners
@@ -275,10 +335,12 @@ class JobRunnerSrv @Inject() (
           extractReport(maybeJobFolder.get /* can't be none */, job)(authContext, executionContext)
         case Failure(error) =>
           logger.error(s"Worker execution fails", error)
-          endJob(job, JobStatus.Failure, Option(error.getMessage), maybeJobFolder.map(jf => readFile(jf.resolve("input").resolve("input.json"))))(
-            authContext,
-            executionContext
-          )
+          endJob(
+            job,
+            JobStatus.Failure,
+            Option(error.getMessage),
+            maybeJobFolder.map(jf => readFile(jf.resolve("input").resolve("input.json")))
+          )(authContext, executionContext).map(AttemptFinished)
 
       }(executionContext)
       .andThen {
@@ -316,6 +378,11 @@ class JobRunnerSrv @Inject() (
 }
 
 object JobRunnerSrv {
+  sealed private[services] trait AttemptOutcome
+  final private[services] case class AttemptFinished(job: Job) extends AttemptOutcome
+  final private[services] case class AttemptThrottled(message: String, retryAfter: Option[FiniteDuration], input: Option[String])
+      extends AttemptOutcome
+
   def applyImagePrefix(prefix: String, dockerImage: String): String =
     if (prefix.isEmpty) dockerImage
     else prefix + dockerImage
